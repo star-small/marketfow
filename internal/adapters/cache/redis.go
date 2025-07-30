@@ -25,6 +25,9 @@ func NewRedisAdapter(client *redis.Client) port.Cache {
 }
 
 // SetPrice stores price data with timestamp
+// File: internal/adapters/cache/redis.go
+// Replace your existing SetPrice method with this:
+
 func (r *RedisAdapter) SetPrice(ctx context.Context, key string, data domain.MarketData) error {
 	// Store latest price for quick access
 	latestKey := fmt.Sprintf("latest:%s:%s", data.Symbol, data.Exchange)
@@ -40,10 +43,18 @@ func (r *RedisAdapter) SetPrice(ctx context.Context, key string, data domain.Mar
 
 	// Store in time-series sorted set for range queries
 	timeSeriesKey := fmt.Sprintf("timeseries:%s:%s", data.Symbol, data.Exchange)
-	score := float64(data.Timestamp)
+
+	// ✅ FIX: Convert milliseconds to seconds for consistent querying
+	var score float64
+	if data.Timestamp > 1e12 { // If timestamp looks like milliseconds (> year 2001 in ms)
+		score = float64(data.Timestamp) / 1000.0 // Convert milliseconds to seconds
+	} else {
+		score = float64(data.Timestamp) // Already in seconds
+	}
+
 	member := fmt.Sprintf("%f", data.Price)
 
-	// Add to sorted set with score as timestamp
+	// Add to sorted set with score as timestamp IN SECONDS
 	if err := r.client.ZAdd(ctx, timeSeriesKey, redis.Z{
 		Score:  score,
 		Member: member,

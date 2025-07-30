@@ -2,13 +2,6 @@ package server
 
 import (
 	"context"
-	"cryptomarket/internal/core/service/health"
-	"database/sql"
-	"fmt"
-	"log/slog"
-	"net/http"
-	"time"
-
 	"cryptomarket/internal/adapters/cache"
 	v1 "cryptomarket/internal/adapters/handler/http/v1"
 	"cryptomarket/internal/adapters/repository/postgres"
@@ -16,7 +9,14 @@ import (
 	"cryptomarket/internal/core/domain"
 	"cryptomarket/internal/core/port"
 	"cryptomarket/internal/core/service/exchange"
+	"cryptomarket/internal/core/service/health"
 	"cryptomarket/internal/core/service/prices"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -109,6 +109,79 @@ func (app *App) Initialize() error {
 
 	// 6. Set up debug routes (ONLY for debugging - remove in production)
 	v1.SetDebugRoutes(app.router, cacheAdapter, app.redisClient)
+
+	app.router.HandleFunc("GET /debug/timestamps", func(w http.ResponseWriter, r *http.Request) {
+		if app.redisClient == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"error": "Redis not available"}`))
+			return
+		}
+
+		ctx := context.Background()
+		symbol := "BTCUSDT"
+
+		// Get the keys
+		pattern := fmt.Sprintf("timeseries:%s:*", symbol)
+		keys, err := app.redisClient.Keys(ctx, pattern).Result()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(fmt.Sprintf(`{"error": "Failed to get keys: %s"}`, err.Error())))
+			return
+		}
+
+		result := make(map[string]interface{})
+		result["keys"] = keys
+		result["current_time"] = time.Now().Unix()
+		result["current_time_str"] = time.Now().Format(time.RFC3339)
+
+		// For each key, get some sample data with scores (timestamps)
+		for _, key := range keys {
+			// Get total count
+			count, _ := app.redisClient.ZCard(ctx, key).Result()
+
+			// Get the 5 most recent entries with their scores (timestamps)
+			recent, err := app.redisClient.ZRevRangeWithScores(ctx, key, 0, 4).Result()
+			if err == nil {
+				keyInfo := map[string]interface{}{
+					"total_count":    count,
+					"recent_entries": recent,
+				}
+
+				// Convert scores to human readable timestamps
+				if len(recent) > 0 {
+					timestamps := make([]string, 0)
+					for _, entry := range recent {
+						timestamp := int64(entry.Score)
+						timeStr := time.Unix(timestamp, 0).Format(time.RFC3339)
+						timestamps = append(timestamps, fmt.Sprintf("Score: %.0f -> %s", entry.Score, timeStr))
+					}
+					keyInfo["timestamps_decoded"] = timestamps
+				}
+
+				result[key] = keyInfo
+			}
+		}
+
+		// Also check if there are "latest" keys
+		latestPattern := fmt.Sprintf("latest:%s:*", symbol)
+		latestKeys, err := app.redisClient.Keys(ctx, latestPattern).Result()
+		if err == nil {
+			result["latest_keys"] = latestKeys
+
+			// Get sample data from latest keys
+			latestData := make(map[string]string)
+			for _, key := range latestKeys {
+				data, err := app.redisClient.Get(ctx, key).Result()
+				if err == nil {
+					latestData[key] = data
+				}
+			}
+			result["latest_data_sample"] = latestData
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
 
 	// 7. Start background data processing
 	go app.startMarketDataProcessor()
